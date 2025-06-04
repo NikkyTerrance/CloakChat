@@ -17,6 +17,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                            QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                            QTextEdit, QStackedWidget, QMessageBox)
 from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.asymmetric import rsa, padding as rsa_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.backends import default_backend
+import base64
+
 
 # DHT implementation using Kademlia
 import kademlia
@@ -39,6 +46,21 @@ class TorDHTChat:
         # Create hidden service directory if it doesn't exist
         if not os.path.exists(self.hidden_service_dir):
             os.makedirs(self.hidden_service_dir)
+
+    def get_static_salt(self, username):
+        """Returns a consistent per-user salt for key derivation"""
+        return hashlib.sha256(f"torchat_salt::{username}".encode()).digest()
+
+    
+    
+    def get_username_by_onion(self, onion_id):
+        """Finds the username that matches a given onion ID"""
+        for username, data in self.users.items():
+            if data.get("onion_id") == onion_id:
+                return username
+        return None
+
+
 
     def get_bootstrap_nodes(self):
         """Read the bootstrap node info if available"""
@@ -152,22 +174,43 @@ class TorDHTChat:
             print(f"Error starting Tor: {e}")
             return False
     
-    def create_onion_service(self, port=5000):
-        print("Creating onion service...")
+
+    def create_onion_service(self, username, port=5000):
+        print("Creating persistent onion service...")
         try:
             with Controller.from_port(port=self.control_port) as controller:
                 controller.authenticate()
                 
-                # Create a hidden service
-                response = controller.create_ephemeral_hidden_service(
-                    {port: port}, 
-                    await_publication=True
-                )
+                # Path to save/reuse the hidden service private key
+                key_path = os.path.join(self.hidden_service_dir, f"{username}_hs_key")
+
+                if os.path.exists(key_path):
+                    print("[INFO] Found existing onion service key, reusing it.")
+                    with open(key_path, "r") as f:
+                        key_type, key_content = f.read().strip().split(":", 1)
+
+                    response = controller.create_ephemeral_hidden_service(
+                        {port: port},
+                        key_type=key_type,
+                        key_content=key_content,
+                        await_publication=True
+                    )
+                else:
+                    print("[INFO] No existing key found. Creating new onion service.")
+                    response = controller.create_ephemeral_hidden_service(
+                        {port: port},
+                        await_publication=True
+                    )
+                    # Save private key for future reuse
+                    with open(key_path, "w") as f:
+                        f.write(f"{response.private_key_type}:{response.private_key}")
+                    print(f"[INFO] Saved new onion service key to {key_path}")
+                
                 self.onion_address = response.service_id + ".onion"
-                print(f"Onion service created: {self.onion_address}")
+                print(f"[INFO] Onion service created: {self.onion_address}")
                 return self.onion_address
         except Exception as e:
-            print(f"Error creating onion service: {e}")
+            print(f"[ERROR] Failed to create persistent onion service: {e}")
             return None
 
     
@@ -206,7 +249,35 @@ class TorDHTChat:
         except Exception as e:
             print(f"[ERROR] Error starting DHT node: {e}")
             return False
+        
+    def xor_obfuscate(self, data, key="torchat"):
+        key_bytes = key.encode()
+        data_bytes = data.encode()
+        return ''.join(chr(b ^ key_bytes[i % len(key_bytes)]) for i, b in enumerate(data_bytes))
 
+    def store_obfuscated_message(self, recipient_onion, plaintext, sender):
+        obfuscated = base64.b64encode(self.xor_obfuscate(plaintext).encode()).decode()
+        return self.store_message(recipient_onion, obfuscated, sender)
+
+
+    def get_obfuscated_message(self, onion_id):
+        msg = self.get_messages(onion_id)
+        if msg:
+            # Only perform obfuscation on text messages, not on images
+            if msg and not msg.get("is_image", False):
+                try:
+                    # Make sure we're dealing with a string for text content
+                    if isinstance(msg.get("content"), str):
+                        decoded = base64.b64decode(msg["content"]).decode()
+                        msg["content"] = self.xor_obfuscate(decoded)
+                except Exception as e:
+                    print(f"[WARNING] Failed to decode/obfuscate message: {e}")
+            
+            # Make sure to preserve the is_image flag
+            return msg
+        return None
+
+   
 
 
             
@@ -236,37 +307,6 @@ class TorDHTChat:
             print("[WARNING] No bootstrap nodes found. This instance will be the first DHT node.")
 
         print("[INFO] DHT server setup complete")
-   
-
-    # def store_message(self, recipient_onion, message, sender):
-    #     message_data = {
-    #         "sender": sender,
-    #         "content": message,
-    #         "timestamp": time.time(),
-    #         "read": False  # Mark as unread initially
-    #     }
-
-    #     try:
-    #         print(f"[DEBUG] Attempting to store message for {recipient_onion}")
-    #         print(f"[DEBUG] Message content: {message_data}")
-
-        
-    #         future = asyncio.run_coroutine_threadsafe(
-    #             self.dht_node.set(str(recipient_onion), json.dumps(message_data)),
-    #             self.loop
-    #         )
-    #         try:
-    #             future.result(timeout=5)
-    #             print(f"[INFO] Message stored successfully for {recipient_onion}")
-    #         except Exception as e:
-    #             print(f"[ERROR] Failed to store message: {e}")
-
-    #         print("[DEBUG] Message successfully stored in DHT!")  # Confirmation
-    #         return True
-    #     except Exception as e:
-    #         print(f"[ERROR] Failed to store message: {e}")
-    #         return False
-
     
     def store_message(self, recipient_onion, message, sender, is_image=False):
         message_data = {
@@ -297,46 +337,6 @@ class TorDHTChat:
             print(f"[ERROR] Failed to store message: {e}")
             return False
 
-    
-    # def get_messages(self, onion_id):
-    #     """Retrieve messages from DHT and delete them after retrieval"""
-    #     try:
-    #         print(f"[DEBUG] Checking DHT for messages for {onion_id}")
-
-    #         future = asyncio.run_coroutine_threadsafe(
-    #             self.dht_node.get(str(onion_id)),
-    #             self.loop
-    #         )
-    #         result = future.result(timeout=5.0)
-
-    #         print(f"[DEBUG] Raw response from DHT: {result}")  # Debugging
-
-    #         if result:
-    #             try:
-    #                 messages = json.loads(result)
-    #                 print(f"[DEBUG] Messages found in DHT: {messages}")
-    #                 print(f"[DEBUG] Message type: {'Image' if messages.get('is_image') else 'Text'}")
-
-    #                 # Delete the message after retrieval
-    #                 delete_future = asyncio.run_coroutine_threadsafe(
-    #                     self.dht_node.set(str(onion_id), ""),  # Clearing message from DHT
-    #                     self.loop
-    #                 )
-    #                 delete_future.result(timeout=5.0)
-
-    #                 return messages
-    #             except json.JSONDecodeError as e:
-    #                 print(f"[ERROR] Failed to parse message JSON: {e}")
-    #                 return None
-    #         print("[DEBUG] No messages found in DHT.")
-    #         return None
-
-    #     except asyncio.TimeoutError:
-    #         print("[ERROR] Timeout while getting messages.")
-    #         return None
-    #     except Exception as e:
-    #         print(f"[ERROR] Error getting messages: {e}")
-    #         return None
     def get_messages(self, onion_id):
         """Retrieve messages from DHT and delete them after retrieval"""
         try:
@@ -348,13 +348,26 @@ class TorDHTChat:
             )
             result = future.result(timeout=5.0)
 
-            print(f"[DEBUG] Raw response from DHT: {result}")  # Debugging
+            print(f"[DEBUG] Raw response from DHT: {result}")
 
             if result:
                 try:
                     messages = json.loads(result)
                     print(f"[DEBUG] Messages found in DHT: {messages}")
-                    print(f"[DEBUG] Message type: {'Image' if messages.get('is_image') else 'Text'}")
+                    
+                    # Explicitly check for image flag
+                    is_image = messages.get("is_image", False)
+                    print(f"[DEBUG] Message type: {'Image' if is_image else 'Text'}")
+
+                    # If it's an image, don't try to decode/obfuscate the content
+                    if not is_image and not messages.get("is_encrypted", False):
+                        try:
+                            # Only decode/unobfuscate if it's regular text
+                            if isinstance(messages.get("content"), str):
+                                decoded = base64.b64decode(messages["content"]).decode()
+                                messages["content"] = self.xor_obfuscate(decoded)
+                        except Exception as e:
+                            print(f"[WARNING] Failed to decode/obfuscate message: {e}")
 
                     # Generate a unique key to identify this specific message
                     message_id = f"{onion_id}_{messages['timestamp']}"
@@ -395,7 +408,9 @@ class TorDHTChat:
         except Exception as e:
             print(f"[ERROR] Error getting messages: {e}")
             return None
-        
+   
+
+
     def stop(self):
         # Delete bootstrap_node.json if it exists
         try:
@@ -418,20 +433,7 @@ class TorDHTChat:
                 print("Tor process terminated")
             except Exception as e:
                 print(f"Error terminating Tor: {e}")
-    # def stop(self):
-    #     if self.loop and self.loop.is_running():
-    #         try:
-    #             asyncio.run_coroutine_threadsafe(self._shutdown_dht(), self.loop)
-    #             self.loop.call_soon_threadsafe(self.loop.stop)
-    #         except Exception as e:
-    #             print(f"Error shutting down DHT: {e}")
-        
-    #     if self.tor_process:
-    #         try:
-    #             self.tor_process.kill()
-    #             print("Tor process terminated")
-    #         except Exception as e:
-    #             print(f"Error terminating Tor: {e}")
+   
     
     async def _shutdown_dht(self):
         if self.dht_node:
@@ -439,12 +441,10 @@ class TorDHTChat:
             print("DHT node stopped")
 
 
-# class SignalsEmitter(QObject):
-#     message_received = pyqtSignal(str, str)
-#     status_update = pyqtSignal(str)
 class SignalsEmitter(QObject):
-    message_received = pyqtSignal(str, str, bool)  # sender, content, is_image
+    message_received = pyqtSignal(str, str)
     status_update = pyqtSignal(str)
+
 
 
 class ChatGUI(QMainWindow):
@@ -584,136 +584,68 @@ class ChatGUI(QMainWindow):
         
         self.stacked_widget.addWidget(signup_widget)
     
-    # def create_chat_page(self):
-    #     chat_widget = QWidget()
-    #     chat_layout = QVBoxLayout(chat_widget)
-        
-    #     # Header with username and onion ID
-    #     header_layout = QHBoxLayout()
-    #     self.user_label = QLabel()
-    #     self.user_label.setStyleSheet("font-weight: bold;")
-    #     self.onion_id_label = QLabel()
-    #     header_layout.addWidget(self.user_label)
-    #     header_layout.addWidget(self.onion_id_label)
-        
-    #     # New chat section
-    #     new_chat_layout = QHBoxLayout()
-    #     recipient_label = QLabel("Recipient Onion ID:")
-    #     self.recipient_input = QLineEdit()
-    #     new_chat_button = QPushButton("Start Chat")
-    #     new_chat_button.clicked.connect(self.start_new_chat)
-    #     new_chat_layout.addWidget(recipient_label)
-    #     new_chat_layout.addWidget(self.recipient_input)
-    #     new_chat_layout.addWidget(new_chat_button)
-        
-    #     # Chat window
-    #     self.chat_window = QTextEdit()
-    #     self.chat_window.setReadOnly(True)
-        
-    #     # Message input
-    #     message_layout = QHBoxLayout()
-    #     self.message_input = QTextEdit()
-    #     self.message_input.setMaximumHeight(70)
-    #     send_button = QPushButton("Send")
-    #     send_button.clicked.connect(self.send_message)
-    #     message_layout.addWidget(self.message_input)
-    #     message_layout.addWidget(send_button)
-        
-    #     # Logout button
-    #     logout_button = QPushButton("Logout")
-    #     logout_button.clicked.connect(self.handle_logout)
-        
-    #     chat_layout.addLayout(header_layout)
-    #     chat_layout.addLayout(new_chat_layout)
-    #     chat_layout.addWidget(self.chat_window)
-    #     chat_layout.addLayout(message_layout)
-    #     chat_layout.addWidget(logout_button)
-        
-    #     self.stacked_widget.addWidget(chat_widget)
 
     def send_image(self):
         """Handle sending an image"""
         from PyQt5.QtWidgets import QFileDialog
-        
+
         if not hasattr(self, 'current_recipient') or not self.current_recipient:
             QMessageBox.warning(self, "Error", "Please select a recipient first")
             return
-        
-        # Open file dialog to select an image
+
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg *.gif *.bmp)")
-        
+            self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg *.gif *.bmp)"
+        )
         if not file_path:
             return  # User canceled selection
-        
+
         try:
-            # Open and resize the image to prevent very large messages
             with Image.open(file_path) as img:
-                # Resize if the image is too large (adjust dimensions as needed)
-                max_size = (800, 600)
+                # Resize and compress image to fit under DHT size constraints
+                max_size = (300, 200)
                 img.thumbnail(max_size, Image.LANCZOS)
-                
-                # Save to BytesIO object
+
                 buffer = BytesIO()
-                img.save(buffer, format=img.format)
+                img = img.convert("RGB")  
+                img.save(buffer, format="JPEG", quality=40)
                 buffer.seek(0)
-                
-                # Encode to base64
+
                 img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-                
-                # Display a preview
-                pixmap = QPixmap(file_path)
-                pixmap = pixmap.scaled(400, 300, aspectRatioMode=Qt.KeepAspectRatio)
-                
+                print(f"[DEBUG] Base64 image size: {len(img_base64)} characters")
+
+                # Display a preview using original file
+                preview_pixmap = QPixmap(file_path)
+                preview_pixmap = preview_pixmap.scaled(300, 200, aspectRatioMode=Qt.KeepAspectRatio)
+
                 # Store in DHT
                 self.signals.status_update.emit(f"Sending image to {self.current_recipient}...")
+                
+                # Create a proper message object
                 if self.tor_dht_chat.store_message(
-                    self.current_recipient, 
-                    img_base64,  # Send the base64-encoded image
+                    self.current_recipient,
+                    img_base64,
                     self.current_user,
-                    is_image=True
+                    is_image=True  
                 ):
-                    # Show in our chat window
                     self.chat_window.append("You: [Image sent]")
-                    # Display the image we sent in our chat window
-                    self.display_image_in_chat(pixmap)
+                    self.display_image_in_chat(pixmap=preview_pixmap)
                     self.signals.status_update.emit("Image sent")
                 else:
                     QMessageBox.warning(self, "Error", "Failed to send image. DHT may be unavailable.")
-        
+
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to send image: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
-    # def display_image_in_chat(self, pixmap=None, base64_data=None):
-    #     """Display an image in the chat window"""
-    #     cursor = self.chat_window.textCursor()
-    #     cursor.movePosition(QTextEdit.MoveOperation.End)
-        
-    #     if pixmap is None and base64_data:
-    #         # Decode base64 to image
-    #         try:
-    #             img_data = base64.b64decode(base64_data)
-    #             img = QImage()
-    #             img.loadFromData(img_data)
-    #             pixmap = QPixmap.fromImage(img)
-    #             pixmap = pixmap.scaled(400, 300, aspectRatioMode=Qt.KeepAspectRatio)
-    #         except Exception as e:
-    #             print(f"Error decoding image: {e}")
-    #             return
-        
-    #     if pixmap:
-    #         self.chat_window.document().addResource(
-    #             QTextEdit.ResourceType.ImageResource,
-    #             QUrl("image"),
-    #             pixmap
-    #         )
-    #         cursor.insertImage("image")
-    #         cursor.insertBlock()
 
     def display_image_in_chat(self, pixmap=None, base64_data=None):
         """Display an image in the chat window"""
         from PyQt5.QtCore import QUrl
         from PyQt5.QtGui import QTextCursor, QImage
+        from io import BytesIO
+        from PIL import Image
+        import base64
         
         try:
             print(f"[DEBUG] Attempting to display image - pixmap: {pixmap is not None}, base64: {base64_data is not None}")
@@ -727,16 +659,44 @@ class ChatGUI(QMainWindow):
                     print(f"[DEBUG] Decoding base64 image, length: {len(base64_data)}")
                     img_data = base64.b64decode(base64_data)
                     print(f"[DEBUG] Decoded image data size: {len(img_data)} bytes")
-                    img = QImage()
-                    loaded = img.loadFromData(img_data)
-                    print(f"[DEBUG] Image loaded successfully: {loaded}")
-                    if loaded:
-                        pixmap = QPixmap.fromImage(img)
-                        pixmap = pixmap.scaled(400, 300, aspectRatioMode=Qt.KeepAspectRatio)
-                        print(f"[DEBUG] Pixmap created: {not pixmap.isNull()}")
-                    else:
-                        print("[ERROR] Failed to load image data")
+                    
+                    # Try two approaches for maximum compatibility
+                    try:
+                        # Method 1: Direct QImage loading
+                        img = QImage()
+                        loaded = img.loadFromData(img_data)
+                        print(f"[DEBUG] QImage direct load result: {loaded}")
+                        
+                        if not loaded:
+                            # Method 2: Load with PIL and convert
+                            print("[DEBUG] Trying PIL method")
+                            buffer = BytesIO(img_data)
+                            pil_img = Image.open(buffer)
+                            pil_img = pil_img.convert("RGB")  
+                            
+                            # Save to new BytesIO with explicit format
+                            new_buffer = BytesIO()
+                            pil_img.save(new_buffer, format="JPEG")
+                            new_buffer.seek(0)
+                            
+                            img = QImage()
+                            loaded = img.loadFromData(new_buffer.getvalue())
+                            print(f"[DEBUG] QImage via PIL load result: {loaded}")
+                        
+                        if loaded:
+                            pixmap = QPixmap.fromImage(img)
+                            pixmap = pixmap.scaled(400, 300, aspectRatioMode=Qt.KeepAspectRatio)
+                            print(f"[DEBUG] Pixmap created: {not pixmap.isNull()}")
+                        else:
+                            print("[ERROR] Failed to load image data with both methods")
+                            return
+                            
+                    except Exception as inner_e:
+                        print(f"[ERROR] Inner error in image processing: {inner_e}")
+                        import traceback
+                        traceback.print_exc()
                         return
+                        
                 except Exception as e:
                     print(f"[ERROR] Error decoding image: {e}")
                     import traceback
@@ -842,7 +802,8 @@ class ChatGUI(QMainWindow):
                 return
 
             self.signals.status_update.emit("Creating onion service...")
-            onion_address = self.tor_dht_chat.create_onion_service()
+            onion_address = self.tor_dht_chat.create_onion_service(username)
+
             if not onion_address:
                 QMessageBox.critical(self, "Error", "Failed to create onion service. Check the logs.")
                 return
@@ -922,7 +883,9 @@ class ChatGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter a recipient onion ID")
             return
         
-        self.current_recipient = recipient
+        # self.current_recipient = recipient
+        self.current_recipient = recipient  # Should be the known username from users.json
+
         self.chat_window.clear()
         self.chat_window.append(f"--- Starting chat with {recipient} ---")
     
@@ -938,12 +901,13 @@ class ChatGUI(QMainWindow):
         try:
             self.signals.status_update.emit(f"Sending message to {self.current_recipient}...")
             
-            # Store message in DHT
-            if self.tor_dht_chat.store_message(
+           
+            if self.tor_dht_chat.store_obfuscated_message(
                 self.current_recipient, 
                 message, 
                 self.current_user
             ):
+
                 # Update chat window
                 self.chat_window.append(f"You: {message}")
                 self.message_input.clear()
@@ -952,71 +916,81 @@ class ChatGUI(QMainWindow):
                 QMessageBox.warning(self, "Error", "Failed to send message. DHT may be unavailable.")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to send message: {str(e)}")
+    
+ 
     def check_messages(self):
         while self.running:
             try:
                 if self.current_user and self.tor_dht_chat.onion_address:
-                    messages = self.tor_dht_chat.get_messages(self.tor_dht_chat.onion_address)
+                    messages = self.tor_dht_chat.get_obfuscated_message(self.tor_dht_chat.onion_address)
+
                     if messages:
+                        sender = messages["sender"]
                         is_image = messages.get("is_image", False)
-                        print(f"[DEBUG] Received message - is_image: {is_image}")
+                        content = messages["content"]
+
                         if is_image:
-                            print(f"[DEBUG] Image data length: {len(messages['content']) if messages['content'] else 0}")
-                        
-                        # Make sure we're emitting the correct signal with all parameters
-                        self.signals.message_received.emit(
-                            messages["sender"], 
-                            messages["content"], 
-                            is_image
-                        )
-            except Exception as e:
-                print(f"Error checking messages: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            time.sleep(5)  # Check every 5 seconds
+                            print(f"[DEBUG] Displaying received image from {sender}")
+                            self.signals.message_received.emit(sender, json.dumps({
+                                "is_image": True,
+                                "content": content
+                            }))
+                        else:
+                            self.signals.message_received.emit(sender, content)
 
-    # def check_messages(self):
-    #     while self.running:
-    #         try:
-    #             if self.current_user and self.tor_dht_chat.onion_address:
-    #                 messages = self.tor_dht_chat.get_messages(self.tor_dht_chat.onion_address)
-    #                 if messages:
-    #                     is_image = messages.get("is_image", False)
-    #                     self.signals.message_received.emit(
-    #                         messages["sender"], 
-    #                         messages["content"], 
-    #                         is_image
-    #                     )
-    #         except Exception as e:
-    #             print(f"Error checking messages: {e}")
-            
-    #         time.sleep(5)  # Check every 5 seconds
-    
-    # def check_messages(self):
-    #     while self.running:
-    #         try:
-    #             if self.current_user and self.tor_dht_chat.onion_address:
-    #                 messages = self.tor_dht_chat.get_messages(self.tor_dht_chat.onion_address)
-    #                 if messages:
-    #                     self.signals.message_received.emit(messages["sender"], messages["content"])
-    #         except Exception as e:
-    #             print(f"Error checking messages: {e}")
-            
-    #         time.sleep(5)  # Check every 5 seconds
-    
-    # def update_chat_window(self, sender, content):
-    #     self.chat_window.append(f"{sender}: {content}")
-
-    def update_chat_window(self, sender, content, is_image=False):
-        self.chat_window.append(f"{sender}: {'[Image]' if is_image else content}")
-        
-        if is_image:
-            try:
-                # Display the received image
-                self.display_image_in_chat(base64_data=content)
             except Exception as e:
-                print(f"Error displaying received image: {e}")
+                print(f"[ERROR] Error checking messages: {e}")
+            
+            time.sleep(5)
+    
+ 
+    def update_chat_window(self, sender, content):
+        try:
+            # Check if the message is from the DHT
+            if isinstance(content, dict):
+                # Handle older message format
+                is_image = content.get("is_image", False)
+                actual_content = content.get("content", "")
+                self.chat_window.append(f"{sender}: {'[Image]' if is_image else actual_content}")
+                
+                if is_image:
+                    self.display_image_in_chat(base64_data=actual_content)
+                return
+            
+            if isinstance(content, str):
+                try:
+                    import json
+                    msg_data = json.loads(content)
+                    if isinstance(msg_data, dict) and msg_data.get("is_image", False):
+                        self.chat_window.append(f"{sender}: [Image]")
+                        self.display_image_in_chat(base64_data=msg_data.get("content", ""))
+                        return
+                except json.JSONDecodeError:
+                    pass  
+            
+            # Regular text message
+            message = content
+            is_image = False
+            
+            # Check if we need to parse the message object
+            if isinstance(content, dict):
+                message = content.get("content", "")
+                is_image = content.get("is_image", False)
+                
+            self.chat_window.append(f"{sender}: {'[Image]' if is_image else message}")
+            
+            if is_image:
+                try:
+                    # Display the received image
+                    self.display_image_in_chat(base64_data=message)
+                except Exception as e:
+                    print(f"[ERROR] Error displaying received image: {e}")
+                    import traceback
+                    traceback.print_exc()
+        except Exception as e:
+            print(f"[ERROR] Error in update_chat_window: {e}")
+            import traceback
+            traceback.print_exc()
 
 def main():
     tor_path = "C:\\Users\\Lgnik\\Desktop\\Tor Browser\\Browser\\TorBrowser\\Tor\\tor.exe"
